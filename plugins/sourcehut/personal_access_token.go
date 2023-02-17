@@ -2,10 +2,10 @@ package sourcehut
 
 import (
 	"context"
-	"encoding/json"
 	"os"
 	"path/filepath"
 
+	"git.sr.ht/~emersion/go-scfg"
 	"github.com/1Password/shell-plugins/sdk"
 	"github.com/1Password/shell-plugins/sdk/importer"
 	"github.com/1Password/shell-plugins/sdk/provision"
@@ -45,28 +45,89 @@ func PersonalAccessToken() schema.CredentialType {
 		)}
 }
 
+// TODO: Make this work (load from config file)
 func sourcehutConfigFile(in sdk.ProvisionInput) ([]byte, error) {
-	config := Config{
-		Token:       in.ItemFields[fieldname.Token],
-		InstanceURL: in.ItemFields[fieldname.URL],
-	}
+	return []byte{}, nil
+}
 
-	contents, err := json.Marshal(config)
+func getSourcehutConfigFilePath() (string, error) {
+	configDir, err := os.UserConfigDir()
 	if err != nil {
-		return nil, err
+		return "", err
 	}
-
-	return []byte(contents), nil
+	return filepath.Join(configDir, "hut", "config")
 }
 
 // TODO: Check if the platform stores the Personal Access Token in a local config file, and if so,
 // implement the function below to add support for importing it.
 func TrysourcehutConfigFile() sdk.Importer {
-	configDir, err := os.UserConfigDir()
+	configFilePath, err := getSourcehutConfigFilePath()
 	if err != nil {
 		return nil
 	}
-	return importer.TryFile(filepath.Join(configDir, "hut", "config"), func(ctx context.Context, contents importer.FileContents, in sdk.ImportInput, out *sdk.ImportAttempt) {
+	return importer.TryFile(configFilePath, func(ctx context.Context, contents importer.FileContents, in sdk.ImportInput, out *sdk.ImportAttempt) {
+		rootBlock, err := scfg.Load(configFilePath)
+		if err != nil {
+			return
+		}
+		var config Config
+		instanceNames := make(map[string]struct{})
+		for _, instanceDir := range rootBlock.GetAll("instance") {
+			instance := &InstanceConfig{
+				Origins: make(map[string]string),
+			}
+
+			if err := instanceDir.ParseParams(&instance.Name); err != nil {
+				return
+			}
+
+			if _, ok := instanceNames[instance.Name]; ok {
+				return
+			}
+			instanceNames[instance.Name] = struct{}{}
+
+			if dir := instanceDir.Children.Get("access-token"); dir != nil {
+				if err := dir.ParseParams(&instance.AccessToken); err != nil {
+					return
+				}
+			}
+			if dir := instanceDir.Children.Get("access-token-cmd"); dir != nil {
+				if len(dir.Params) == 0 {
+					return
+				}
+				instance.AccessTokenCmd = dir.Params
+			}
+			if instance.AccessToken == "" && len(instance.AccessTokenCmd) == 0 {
+				return
+			}
+			if instance.AccessToken != "" && len(instance.AccessTokenCmd) > 0 {
+				return
+			}
+
+			for _, service := range []string{"builds", "git", "hg", "lists", "meta", "pages", "paste", "todo"} {
+				serviceDir := instanceDir.Children.Get(service)
+				if serviceDir == nil {
+					continue
+				}
+
+				originDir := serviceDir.Children.Get("origin")
+				if originDir == nil {
+					continue
+				}
+
+				var origin string
+				if err := originDir.ParseParams(&origin); err != nil {
+					return
+				}
+
+				instance.Origins[service] = origin
+			}
+
+			cfg.Instances = append(cfg.Instances, instance)
+		}
+
+		return cfg, nil
+
 		// var config Config
 		// if err := contents.ToYAML(&config); err != nil {
 		// 	out.AddError(err)
@@ -86,6 +147,15 @@ func TrysourcehutConfigFile() sdk.Importer {
 }
 
 type Config struct {
-	Token       string
-	InstanceURL string
+	Token string
+	URL   string
+}
+
+type InstanceConfig struct {
+	Name string
+
+	AccessToken    string
+	AccessTokenCmd []string
+
+	Origins map[string]string
 }
